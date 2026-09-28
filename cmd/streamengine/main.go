@@ -13,12 +13,33 @@ import (
 	"github.com/highcumontoa/event-time-stream-engine-go/internal/engine"
 )
 
+// demoFaultSink 在真实 FileSink 外包一层可控故障，用于本地演练写出失败重试/重放。
+type demoFaultSink struct {
+	inner    *engine.FileSink
+	failNext int
+	logger   *log.Logger
+}
+
+func (s *demoFaultSink) Commit(cpID uint64, results []engine.WindowResult, lates []engine.LateRecord) error {
+	if s.failNext > 0 {
+		s.failNext--
+		s.logger.Printf("[demo] injected sink write failure at checkpoint %d (retained, will retry)", cpID)
+		return fmt.Errorf("injected sink failure at cp=%d", cpID)
+	}
+	return s.inner.Commit(cpID, results, lates)
+}
+
+func (s *demoFaultSink) TruncateTo(cpID uint64) error { return s.inner.TruncateTo(cpID) }
+
 // 本地演示：生成包含乱序、重复与迟到事件的输入文件，
 // 运行引擎进行事件时间窗口聚合，并打印结果与指标。
 func main() {
 	dir := flag.String("dir", "demo-data", "工作目录（输入/输出/检查点）")
 	nEvents := flag.Int("events", 2000, "生成事件数量")
 	crash := flag.Bool("crash", false, "模拟中途崩溃并重启恢复")
+	cpGenerations := flag.Int("cp-generations", 3, "保留的检查点代数上限")
+	restoreID := flag.Uint64("restore-id", 0, "从指定代数检查点恢复（0=最新一代）")
+	sinkFail := flag.Int("sink-fail", 0, "写出阶段前 N 次提交注入失败（演练重试/重放）")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
@@ -38,27 +59,39 @@ func main() {
 
 	logger := log.New(os.Stderr, "[engine] ", log.Lmsgprefix)
 	cfg := engine.Config{
-		WindowSizeMs:      60_000, // 1 分钟窗口
-		AllowedLatenessMs: 30_000, // 允许迟到 30 秒
-		NumShards:         4,
-		Workers:           4,
-		QueueCapacity:     32,
-		CheckpointEvery:   200,
-		Logger:            logger,
+		WindowSizeMs:        60_000, // 1 分钟窗口
+		AllowedLatenessMs:   30_000, // 允许迟到 30 秒
+		NumShards:           4,
+		Workers:             4,
+		QueueCapacity:       32,
+		CheckpointEvery:     200,
+		Logger:              logger,
+		MaxCheckpoints:      *cpGenerations,
+		RestoreCheckpointID: *restoreID,
 	}
 
 	run := func(ctx context.Context) error {
 		src := engine.NewFileSource(inputPath)
 		defer src.Close()
-		sink := engine.NewFileSink(resultsPath, latePath)
+		var sink engine.Sink = engine.NewFileSink(resultsPath, latePath)
+		if *sinkFail > 0 {
+			sink = &demoFaultSink{inner: engine.NewFileSink(resultsPath, latePath), failNext: *sinkFail, logger: logger}
+		}
 		store := engine.NewCheckpointStore(cpPath)
 		e := engine.NewEngine(cfg, src, sink, store)
 		if err := e.Run(ctx); err != nil {
 			return err
 		}
 		st := e.Stats()
-		fmt.Printf("stats: processed=%d duplicates=%d late=%d backpressure_blocks=%d checkpoints=%d\n",
-			st.Processed, st.Duplicates, st.Late, st.BackpressureBlocks, st.Checkpoints)
+		fmt.Printf("stats: processed=%d duplicates=%d late=%d backpressure_blocks=%d checkpoints=%d\n"+
+			"       checkpoint_evictions=%d sink_retries=%d replay_results=%d replay_lates=%d "+
+			"pending_limit_hits=%d sink_fatal=%d\n",
+			st.Processed, st.Duplicates, st.Late, st.BackpressureBlocks, st.Checkpoints,
+			st.CheckpointEvictions, st.SinkRetries, st.SinkReplayResults, st.SinkReplayLates,
+			st.PendingLimitHits, st.SinkFatal)
+		if gens, err := store.List(); err == nil {
+			fmt.Printf("retained checkpoint generations (newest-first): %v\n", gens)
+		}
 		return nil
 	}
 

@@ -462,10 +462,11 @@ func TestRecoverFromCorruptCheckpointFails(t *testing.T) {
 	if _, err := rig.runOnce(t, cfg, context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// 破坏检查点文件。
-	data, _ := os.ReadFile(rig.cpPath)
+	// 破坏检查点文件（最新代数）。
+	gp := genPath(rig.cpPath+genDirSuffix, loadLatestGenID(t, rig.cpPath))
+	data, _ := os.ReadFile(gp)
 	data[len(data)/3] ^= 0xFF
-	os.WriteFile(rig.cpPath, data, 0o644)
+	os.WriteFile(gp, data, 0o644)
 	// 恢复必须明确失败，而不是从中间静默继续。
 	_, err := rig.runOnce(t, cfg, context.Background())
 	if err == nil {
@@ -475,6 +476,19 @@ func TestRecoverFromCorruptCheckpointFails(t *testing.T) {
 		t.Fatalf("error should identify corruption, got: %v", err)
 	}
 	t.Logf("corrupt checkpoint rejected: %v", err)
+}
+
+// loadLatestGenID 返回存储中最新一代检查点 ID（测试辅助）。
+func loadLatestGenID(t *testing.T, cpPath string) uint64 {
+	t.Helper()
+	ids, err := NewCheckpointStore(cpPath).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) == 0 {
+		t.Fatal("no checkpoint generations found")
+	}
+	return ids[0]
 }
 
 func contains(s, sub string) bool {

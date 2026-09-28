@@ -99,10 +99,11 @@ func TestCheckpointCorrupt(t *testing.T) {
 	if err := store.Save(&Checkpoint{ID: 1}); err != nil {
 		t.Fatal(err)
 	}
-	// 篡改文件内容，校验和不再匹配。
-	data, _ := os.ReadFile(path)
+	// 篡改代数文件内容，校验和不再匹配。
+	gp := genPath(store.dir, 1)
+	data, _ := os.ReadFile(gp)
 	data[len(data)/2] ^= 0xFF
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(gp, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := store.Load()
@@ -119,11 +120,11 @@ func TestCheckpointVersionMismatch(t *testing.T) {
 	if err := store.Save(&Checkpoint{ID: 1}); err != nil {
 		t.Fatal(err)
 	}
-	// 用未来版本号写一个校验和合法的检查点文件。
+	// 用未来版本号写一个校验和合法的代数文件，覆盖最新一代。
 	payload, _ := json.Marshal(Checkpoint{ID: 1, Version: checkpointVersion + 1})
 	file := checkpointFile{Payload: payload, Checksum: crc32.ChecksumIEEE(payload)}
 	data, _ := json.Marshal(file)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(genPath(store.dir, 1), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := store.Load()

@@ -99,10 +99,11 @@ func TestCheckpointCorrupt(t *testing.T) {
 	if err := store.Save(&Checkpoint{ID: 1}); err != nil {
 		t.Fatal(err)
 	}
-	// 篡改文件内容，校验和不再匹配。
-	data, _ := os.ReadFile(path)
+	// 篡改实际加载的最新代文件内容，校验和不再匹配。
+	latest := mustLatestGenPath(t, store)
+	data, _ := os.ReadFile(latest)
 	data[len(data)/2] ^= 0xFF
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(latest, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := store.Load()
@@ -112,6 +113,19 @@ func TestCheckpointCorrupt(t *testing.T) {
 	t.Logf("corrupt checkpoint detected: %v", err)
 }
 
+// mustLatestGenPath 返回存储实际加载的最新检查点文件路径。
+func mustLatestGenPath(t *testing.T, store *CheckpointStore) string {
+	t.Helper()
+	ids, err := store.Generations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) == 0 {
+		t.Fatal("no checkpoint generations")
+	}
+	return filepath.Join(store.dir, genName(ids[len(ids)-1]))
+}
+
 func TestCheckpointVersionMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cp.json")
@@ -119,11 +133,12 @@ func TestCheckpointVersionMismatch(t *testing.T) {
 	if err := store.Save(&Checkpoint{ID: 1}); err != nil {
 		t.Fatal(err)
 	}
-	// 用未来版本号写一个校验和合法的检查点文件。
+	// 用未来版本号写一个校验和合法的检查点文件（覆盖最新代文件）。
 	payload, _ := json.Marshal(Checkpoint{ID: 1, Version: checkpointVersion + 1})
 	file := checkpointFile{Payload: payload, Checksum: crc32.ChecksumIEEE(payload)}
 	data, _ := json.Marshal(file)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	latest := mustLatestGenPath(t, store)
+	if err := os.WriteFile(latest, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := store.Load()

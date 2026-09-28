@@ -36,6 +36,7 @@ type testRig struct {
 	resultsPath string
 	latePath    string
 	cpPath      string
+	sink        *FileSink // 非 nil 时复用同一个 sink（用于故障注入）
 }
 
 func newRig(t *testing.T) testRig {
@@ -49,11 +50,16 @@ func newRig(t *testing.T) testRig {
 	}
 }
 
+func (r *testRig) useSink(s *FileSink) { r.sink = s }
+
 func (r testRig) runOnce(t *testing.T, cfg Config, ctx context.Context) (Stats, error) {
 	t.Helper()
 	src := NewFileSource(r.inputPath)
 	defer src.Close()
-	sink := NewFileSink(r.resultsPath, r.latePath)
+	sink := r.sink
+	if sink == nil {
+		sink = NewFileSink(r.resultsPath, r.latePath)
+	}
 	store := NewCheckpointStore(r.cpPath)
 	e := NewEngine(cfg, src, sink, store)
 	err := e.Run(ctx)
@@ -462,12 +468,18 @@ func TestRecoverFromCorruptCheckpointFails(t *testing.T) {
 	if _, err := rig.runOnce(t, cfg, context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// 破坏检查点文件。
-	data, _ := os.ReadFile(rig.cpPath)
+	// 破坏实际加载的最新代检查点文件（不是老路径指针副本）。
+	store := NewCheckpointStore(rig.cpPath)
+	ids, err := store.Generations()
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("expected checkpoint generations: %v", err)
+	}
+	latestPath := filepath.Join(store.dir, genName(ids[len(ids)-1]))
+	data, _ := os.ReadFile(latestPath)
 	data[len(data)/3] ^= 0xFF
-	os.WriteFile(rig.cpPath, data, 0o644)
+	os.WriteFile(latestPath, data, 0o644)
 	// 恢复必须明确失败，而不是从中间静默继续。
-	_, err := rig.runOnce(t, cfg, context.Background())
+	_, err = rig.runOnce(t, cfg, context.Background())
 	if err == nil {
 		t.Fatal("expected recovery failure on corrupt checkpoint")
 	}

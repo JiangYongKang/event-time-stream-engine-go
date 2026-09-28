@@ -19,6 +19,11 @@ func main() {
 	dir := flag.String("dir", "demo-data", "工作目录（输入/输出/检查点）")
 	nEvents := flag.Int("events", 2000, "生成事件数量")
 	crash := flag.Bool("crash", false, "模拟中途崩溃并重启恢复")
+	retain := flag.Int("retain-checkpoints", 3, "保留的检查点代数（超出按 ID 删除）")
+	recoverGen := flag.Uint64("recover-from", 0, "从指定代检查点恢复（0 表示最新代）")
+	maxPending := flag.Int("max-pending-output", 10000, "尚未成功写出的记录上限（窗口结果+迟到记录）")
+	latePolicy := flag.String("late-overflow", "reject", "迟到记录达到待写出上限时的策略：reject|block")
+	sinkFaults := flag.Int("sink-faults", 0, "让前 N 次写出在写出 1 条记录后失败（模拟磁盘写一半，验证进程内续写）")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
@@ -37,28 +42,48 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "[engine] ", log.Lmsgprefix)
+	var policy engine.LateOverflowPolicy
+	switch *latePolicy {
+	case "reject":
+		policy = engine.LateOverflowReject
+	case "block":
+		policy = engine.LateOverflowBlock
+	default:
+		log.Fatalf("unknown -late-overflow=%q (want reject|block)", *latePolicy)
+	}
 	cfg := engine.Config{
-		WindowSizeMs:      60_000, // 1 分钟窗口
-		AllowedLatenessMs: 30_000, // 允许迟到 30 秒
-		NumShards:         4,
-		Workers:           4,
-		QueueCapacity:     32,
-		CheckpointEvery:   200,
-		Logger:            logger,
+		WindowSizeMs:          60_000, // 1 分钟窗口
+		AllowedLatenessMs:     30_000, // 允许迟到 30 秒
+		NumShards:             4,
+		Workers:               4,
+		QueueCapacity:         32,
+		CheckpointEvery:       200,
+		Logger:                logger,
+		RetainCheckpoints:     *retain,
+		RecoverFromGeneration: *recoverGen,
+		MaxPendingOutput:      *maxPending,
+		LateOverflow:          policy,
 	}
 
-	run := func(ctx context.Context) error {
+	run := func(ctx context.Context, faults int) error {
 		src := engine.NewFileSource(inputPath)
 		defer src.Close()
 		sink := engine.NewFileSink(resultsPath, latePath)
+		if faults > 0 {
+			// 前 faults 次写出各在落盘 1 条后失败：模拟磁盘写一半，引擎自动续写补齐。
+			sink.FailNextCommits(faults)
+		}
 		store := engine.NewCheckpointStore(cpPath)
 		e := engine.NewEngine(cfg, src, sink, store)
 		if err := e.Run(ctx); err != nil {
 			return err
 		}
 		st := e.Stats()
-		fmt.Printf("stats: processed=%d duplicates=%d late=%d backpressure_blocks=%d checkpoints=%d\n",
-			st.Processed, st.Duplicates, st.Late, st.BackpressureBlocks, st.Checkpoints)
+		fmt.Printf("stats: processed=%d duplicates=%d late=%d late_rejected=%d backpressure_blocks=%d "+
+			"checkpoints=%d checkpoint_prunes=%d fork_prunes=%d flush_triggers=%d window_defers=%d sink_retries=%d sink_replays=%d\n",
+			st.Processed, st.Duplicates, st.Late, st.LateRejected, st.BackpressureBlocks,
+			st.Checkpoints, st.CheckpointPrunes, st.ForkPrunes, st.FlushTriggers, st.WindowDefers,
+			st.SinkRetries, st.SinkReplays)
 		return nil
 	}
 
@@ -74,11 +99,17 @@ func main() {
 			}
 			cancel()
 		}()
-		_ = run(ctx)
+		_ = run(ctx, *sinkFaults)
 		fmt.Println("--- simulated crash, restarting from checkpoint ---")
+	} else if *sinkFaults > 0 {
+		// 不崩溃、只注入写出故障：验证进程内自动续写，结果与无故障一致。
+		if err := run(context.Background(), *sinkFaults); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
-	if err := run(context.Background()); err != nil {
+	if err := run(context.Background(), 0); err != nil {
 		log.Fatal(err)
 	}
 

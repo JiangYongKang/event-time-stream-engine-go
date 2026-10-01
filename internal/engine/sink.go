@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +14,84 @@ import (
 
 // ErrSinkFault 是故障注入产生的写出错误，测试用它区分“模拟磁盘失败”与真实 I/O 错误。
 var ErrSinkFault = errors.New("simulated sink write fault")
+
+// ErrSinkCorrupt 表示输出文件存在“内容完整但确实损坏”的行：
+// 行以换行结束（一次完整落盘），却无法解析或 CRC 校验不匹配。
+// 这种情况不能当成半截残行硬接，调用方必须明确失败。
+// 注意：写到一半、没有换行结尾的残行不属于此错误，由修复流程裁掉。
+var ErrSinkCorrupt = errors.New("sink file corrupt")
+
+// sinkLineVersion 是输出文件每行封装格式的当前版本。
+const sinkLineVersion = 1
+
+// sinkEnvelope 是结果/迟到文件每一行的磁盘封装：业务记录 + CRC32 校验。
+// 封装让“整行已完整落盘但内容被破坏”可以被明确识别（校验不过），
+// 从而与“写到一半、没有换行的残行”区分开。
+type sinkEnvelope struct {
+	Version int             `json:"v"`
+	CRC     uint32          `json:"crc"`
+	Payload json.RawMessage `json:"p"`
+}
+
+// encodeSinkLine 把一条业务记录编码为带 CRC 的完整行（不含换行符）。
+func encodeSinkLine(rec any) ([]byte, error) {
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(sinkEnvelope{
+		Version: sinkLineVersion,
+		CRC:     crc32.ChecksumIEEE(payload),
+		Payload: payload,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// lineKind 标识一行的磁盘格式。
+type lineKind int
+
+const (
+	lineEnvelope lineKind = iota // 当前格式：CRC 封装，校验已通过
+	lineLegacy                   // 老格式裸记录：可读，但没有 CRC 可校验
+)
+
+// decodeSinkLine 解析一行完整记录（调用方已确保该行以换行结束）。
+// 返回 ErrSinkCorrupt 的情况：封装版本未知、CRC 不匹配或内容无法解析——
+// 这些都是“完整但确实坏掉”的行，绝不允许被当作残行静默处理。
+func decodeSinkLine[T any](raw []byte) (T, lineKind, error) {
+	var rec T
+	var probe map[string]json.RawMessage
+	isEnvelope := false
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		_, hasP := probe["p"]
+		_, hasCRC := probe["crc"]
+		isEnvelope = hasP && hasCRC
+	}
+	if !isEnvelope {
+		// 老版本写出的裸记录行：无 CRC，按原样接受以兼容既有文件。
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return rec, lineLegacy, fmt.Errorf("%w: %v", ErrSinkCorrupt, err)
+		}
+		return rec, lineLegacy, nil
+	}
+	var env sinkEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return rec, lineEnvelope, fmt.Errorf("%w: envelope: %v", ErrSinkCorrupt, err)
+	}
+	if env.Version != sinkLineVersion {
+		return rec, lineEnvelope, fmt.Errorf("%w: unsupported line version %d", ErrSinkCorrupt, env.Version)
+	}
+	if crc32.ChecksumIEEE(env.Payload) != env.CRC {
+		return rec, lineEnvelope, fmt.Errorf("%w: checksum mismatch", ErrSinkCorrupt)
+	}
+	if err := json.Unmarshal(env.Payload, &rec); err != nil {
+		return rec, lineEnvelope, fmt.Errorf("%w: payload: %v", ErrSinkCorrupt, err)
+	}
+	return rec, lineEnvelope, nil
+}
 
 // CommitReport 描述一次提交实际做了什么，用于日志与指标，
 // 让“重试/重放了哪些记录”从外部可见。
@@ -27,6 +107,8 @@ type CommitReport struct {
 
 // FileSink 以本地 JSONL 文件模拟外部写出存储。
 //
+// 每行磁盘格式为带 CRC32 的封装（{v,crc,p}）；旧版本写出的裸记录行仍可直接读取。
+//
 // 恰好一次语义的实现方式：
 //   - 每条写出记录携带产生它的检查点 ID 与稳定身份（窗口坐标 / 事件 ID）；
 //   - 引擎先 Commit(checkpointID, ...) 再持久化该检查点；
@@ -34,6 +116,10 @@ type CommitReport struct {
 //     只补写缺失部分，进程重启或进程内重试都不会重复写出；
 //   - 进程在“提交完成、检查点未保存”之间被杀时，恢复端用 TruncateTo
 //     回滚该批未确认输出后重算，因此也不会丢、不会重。
+//
+// 残行与真损坏的区分（见 RepairTails）：
+//   - 末尾没有换行的半截字节只可能来自写入中途被杀，裁掉后幂等补齐；
+//   - 完整行无法解析或 CRC 不匹配则返回 ErrSinkCorrupt，绝不硬接。
 type FileSink struct {
 	resultsPath string
 	latePath    string
@@ -43,6 +129,13 @@ type FileSink struct {
 	// 故障注入：faultRemaining>0 时，下一次 CommitBatch 在写出 faultAfter 条后失败。
 	faultRemaining int
 	faultAfter     int
+
+	// 撕裂写故障注入：tornRemaining>0 时，下一次提交在写出 tornAfter 条完整记录后，
+	// 把下一条记录的前 tornHalf 个字节（不含换行）落盘并 flush，然后返回 ErrSinkFault。
+	// 这确定性地制造“进程在 write 中途被杀、文件末尾留下半截残行”的现场。
+	tornRemaining int
+	tornAfter     int
+	tornHalf      int
 }
 
 func NewFileSink(resultsPath, latePath string) *FileSink {
@@ -62,6 +155,20 @@ func (s *FileSink) FailNextCommitsAfter(n, after int) {
 	}
 	s.faultRemaining += n
 	s.faultAfter = after
+}
+
+// FailNextTornWrites 让接下来 n 次提交在写出 after 条完整记录后，
+// 把下一条记录只落盘前 half 个字节（无换行）再返回 ErrSinkFault，
+// 从而在文件末尾留下一截真实的半截残行（half<1 时取该行长度的一半）。
+func (s *FileSink) FailNextTornWrites(n, after, half int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if after < 0 {
+		after = 0
+	}
+	s.tornRemaining += n
+	s.tornAfter = after
+	s.tornHalf = half
 }
 
 // Commit 是兼容旧调用的薄包装。
@@ -99,6 +206,11 @@ func (s *FileSink) CommitBatch(checkpointID uint64, results []WindowResult, late
 	if s.faultRemaining > 0 {
 		faultBudget = s.faultAfter
 	}
+	// tornBudget>=0 时，命中的那一条记录只落盘前若干字节（制造半截残行）。
+	tornBudget := -1
+	if s.tornRemaining > 0 {
+		tornBudget = s.tornAfter
+	}
 	written := 0
 	maybeFault := func() error {
 		if faultBudget < 0 {
@@ -111,6 +223,21 @@ func (s *FileSink) CommitBatch(checkpointID uint64, results []WindowResult, late
 		}
 		return nil
 	}
+	torn := func(data []byte) int {
+		if tornBudget < 0 || written < tornBudget {
+			return 0
+		}
+		s.tornRemaining--
+		tornBudget = -1
+		h := s.tornHalf
+		if h < 1 || h >= len(data) {
+			h = len(data) / 2
+		}
+		if h < 1 {
+			h = 1
+		}
+		return h
+	}
 
 	for i := range results {
 		results[i].CheckpointID = checkpointID
@@ -119,11 +246,11 @@ func (s *FileSink) CommitBatch(checkpointID uint64, results []WindowResult, late
 		lates[i].CheckpointID = checkpointID
 	}
 
-	rep.ReplayedResults, rep.WrittenResults, err = appendMissing(s.resultsPath, results, rr, resultID, &written, maybeFault)
+	rep.ReplayedResults, rep.WrittenResults, err = appendMissing(s.resultsPath, results, rr, resultID, &written, maybeFault, torn)
 	if err != nil {
 		return rep, err
 	}
-	rep.ReplayedLates, rep.WrittenLates, err = appendMissing(s.latePath, lates, rl, lateID, &written, maybeFault)
+	rep.ReplayedLates, rep.WrittenLates, err = appendMissing(s.latePath, lates, rl, lateID, &written, maybeFault, torn)
 	if err != nil {
 		return rep, err
 	}
@@ -137,6 +264,44 @@ func resultID(r WindowResult) string {
 
 func lateID(r LateRecord) string { return "L|" + r.Event.ID }
 
+// TailReport 描述一次残行修复对每个输出文件做了什么，供恢复日志说明。
+type TailReport struct {
+	ResultsPath string
+	ResultsTrim bool
+	LatePath    string
+	LateTrim    bool
+}
+
+// Trimmed 报告是否实际裁掉过残数据。
+func (r TailReport) Trimmed() bool { return r.ResultsTrim || r.LateTrim }
+
+// RepairTails 检查并修复两个输出文件末尾写到一半的残行。
+//
+// 规则（残行 vs 真损坏）：
+//   - 末尾没有换行符的半截内容：只可能是进程在 write 中途被杀留下的，
+//     裁掉（truncate + fsync），随后可由检查点批次幂等补齐；
+//   - 以换行完整结束、但无法解析或 CRC 校验不匹配的行：属于真损坏，
+//     原样保留并返回 wrapped ErrSinkCorrupt，绝不静默丢弃“完整”数据。
+//
+// 文件不存在视为正常（尚未产出过），返回 nil。
+func (s *FileSink) RepairTails() (TailReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rep := TailReport{ResultsPath: s.resultsPath, LatePath: s.latePath}
+	trimmed, err := repairPartialTail[WindowResult](s.resultsPath)
+	if err != nil {
+		return rep, err
+	}
+	rep.ResultsTrim = trimmed
+	trimmed, err = repairPartialTail[LateRecord](s.latePath)
+	if err != nil {
+		return rep, err
+	}
+	rep.LateTrim = trimmed
+	return rep, nil
+}
+
 // appendState 是续写前对一个输出文件的扫描结果。
 type appendState struct {
 	exists   map[string]struct{} // 文件中已存在的本批（同 cpID）记录身份
@@ -147,7 +312,7 @@ type appendState struct {
 // 返回的 repaired 标记本次是否实际裁掉过残数据。
 func prepareAppend[T any](path string, checkpointID uint64, idOf func(T) string, cpOf func(T) uint64) (appendState, error) {
 	st := appendState{exists: map[string]struct{}{}}
-	repaired, err := repairPartialTail(path)
+	repaired, err := repairPartialTail[T](path)
 	if err != nil {
 		return st, err
 	}
@@ -167,9 +332,9 @@ func prepareAppend[T any](path string, checkpointID uint64, idOf func(T) string,
 		if len(line) == 0 {
 			continue
 		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return st, fmt.Errorf("sink file %s corrupt: %w", path, err)
+		rec, _, derr := decodeSinkLine[T](line)
+		if derr != nil {
+			return st, fmt.Errorf("%s: %w", path, derr)
 		}
 		if cpOf(rec) > checkpointID {
 			return st, fmt.Errorf("sink file %s contains future checkpoint %d (committing %d): refusing to resume",
@@ -186,9 +351,12 @@ func prepareAppend[T any](path string, checkpointID uint64, idOf func(T) string,
 }
 
 // repairPartialTail 裁掉文件末尾写到一半的残数据，返回是否实际裁剪过。
-// 判定方式：逐行扫描，保留“以换行结束且可解析”的最长合法前缀，
-// 其后的任何字节（无换行的半截行，或有换行但解析失败的最后一行）都裁掉。
-func repairPartialTail(path string) (bool, error) {
+//
+// 判定方式：逐行扫描。完整行（以换行结束）必须可解析且 CRC 通过，
+// 否则视为真正损坏并立即返回 ErrSinkCorrupt，文件原样不动；
+// 读到的最后一段若没有换行结尾，则它是写入中途被杀留下的残行，
+// 连同其后任何字节一起裁掉（JSON 序列化不会产生裸换行，因此残行不可能含换行）。
+func repairPartialTail[T any](path string) (bool, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -212,16 +380,22 @@ func repairPartialTail(path string) (bool, error) {
 		line, rerr := reader.ReadBytes('\n')
 		n := int64(len(line))
 		if rerr == nil {
-			// 完整行：可解析才算合法前缀。
-			var raw map[string]any
-			if json.Unmarshal(trimSpace(line), &raw) == nil {
-				validLen = offset + n
+			// 完整行：必须可解析、校验通过；否则是真正损坏，不做任何修改直接报错。
+			trimmed := trimSpace(line)
+			if len(trimmed) > 0 {
+				if _, _, derr := decodeSinkLine[T](trimmed); derr != nil {
+					return false, fmt.Errorf("%s: %w", path, derr)
+				}
 			}
-		} else {
-			// 读到 EOF（或其它错误）且没有以换行结束 -> 残行，停止。
-			break
+			validLen = offset + n
+			offset += n
+			continue
 		}
-		offset += n
+		if !errors.Is(rerr, io.EOF) {
+			return false, rerr
+		}
+		// EOF：剩余这段没有以换行结束（包括纯空白），属于残行，停止扫描。
+		break
 	}
 	if validLen == size {
 		return false, nil
@@ -234,8 +408,10 @@ func repairPartialTail(path string) (bool, error) {
 
 // appendMissing 追加文件中尚不存在的本批记录，返回（已存在跳过数, 新追加数）。
 // 每条记录立即 flush，使“写一半失败”后已写部分真实可见，续写才能演示去重。
+// torn(data) 返回 >0 时，本条只写前 h 字节并 flush（不写换行）后返回 ErrSinkFault，
+// 在文件末尾确定性留下一截半截残行。
 func appendMissing[T any](path string, records []T, st appendState, idOf func(T) string,
-	written *int, maybeFault func() error) (skipped, added int, err error) {
+	written *int, maybeFault func() error, torn func(data []byte) int) (skipped, added int, err error) {
 	if len(records) == 0 {
 		return 0, 0, nil
 	}
@@ -257,10 +433,22 @@ func appendMissing[T any](path string, records []T, st appendState, idOf func(T)
 			w.Flush()
 			return skipped, added, ferr
 		}
-		data, merr := json.Marshal(rec)
+		data, merr := encodeSinkLine(rec)
 		if merr != nil {
 			w.Flush()
 			return skipped, added, merr
+		}
+		if h := torn(data); h > 0 {
+			if _, werr := w.Write(data[:h]); werr != nil {
+				w.Flush()
+				return skipped, added, werr
+			}
+			// 不写换行并立即 flush：模拟进程在 write 中途被杀。
+			if ferr := w.Flush(); ferr != nil {
+				return skipped, added, ferr
+			}
+			return skipped, added, fmt.Errorf("%w: torn write (half line, no newline) at %s checkpoint",
+				ErrSinkFault, filepath.Base(path))
 		}
 		if _, werr := w.Write(data); werr != nil {
 			w.Flush()
@@ -288,7 +476,14 @@ func appendMissing[T any](path string, records []T, st appendState, idOf func(T)
 
 // TruncateTo 回滚所有属于 checkpointID 之后（未确认）检查点的写出记录。
 // 用于崩溃恢复：检查点保存成功之前的 Commit 视为未提交，必须撤销。
+// 调用前文件末尾可能存在写到一半的残行，先修复再扫描，避免恢复直接失败。
 func (s *FileSink) TruncateTo(checkpointID uint64) error {
+	if _, err := repairPartialTail[WindowResult](s.resultsPath); err != nil {
+		return err
+	}
+	if _, err := repairPartialTail[LateRecord](s.latePath); err != nil {
+		return err
+	}
 	if err := truncateFile[WindowResult](s.resultsPath, checkpointID, func(r WindowResult) uint64 { return r.CheckpointID }); err != nil {
 		return err
 	}
@@ -312,9 +507,9 @@ func truncateFile[T any](path string, checkpointID uint64, cpOf func(T) uint64) 
 		if len(line) == 0 {
 			continue
 		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return fmt.Errorf("sink file %s corrupt: %w", path, err)
+		rec, _, derr := decodeSinkLine[T](line)
+		if derr != nil {
+			return fmt.Errorf("%s: %w", path, derr)
 		}
 		if cpOf(rec) <= checkpointID {
 			kept = append(kept, rec)
@@ -330,7 +525,7 @@ func truncateFile[T any](path string, checkpointID uint64, cpOf func(T) uint64) 
 	}
 	w := bufio.NewWriter(out)
 	for _, rec := range kept {
-		data, err := json.Marshal(rec)
+		data, err := encodeSinkLine(rec)
 		if err != nil {
 			out.Close()
 			return err
@@ -382,9 +577,9 @@ func readAll[T any](path string) ([]T, error) {
 		if len(line) == 0 {
 			continue
 		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("sink file %s corrupt: %w", path, err)
+		rec, _, derr := decodeSinkLine[T](line)
+		if derr != nil {
+			return nil, fmt.Errorf("%s: %w", path, derr)
 		}
 		out = append(out, rec)
 	}

@@ -2,7 +2,7 @@
 
 一个可在本地运行的流处理引擎原型：用本地 JSONL 文件模拟数据源与写出存储，
 实现**事件时间窗口聚合、水位线与迟到处理、恰好一次输出、写出失败续写、
-多代检查点与指定代恢复、资源上限与背压、并发安全**，
+写出中途被杀的半截残行修复、多代检查点与指定代恢复、资源上限与背压、并发安全**，
 使乱序、迟到、写出故障与崩溃恢复之后的结果保持一致且可解释。
 
 ## 运行
@@ -31,8 +31,8 @@ go test -race ./internal/engine/
 | 文件 | 作用 |
 |---|---|
 | `input.jsonl` | 输入事件（每行一个 JSON：`id/key/event_time/value`） |
-| `results.jsonl` | 已提交的窗口结果（每条带 `checkpoint_id`） |
-| `late.jsonl` | 被旁路的迟到事件（带原因与当时水位线） |
+| `results.jsonl` | 已提交的窗口结果。每行是带 CRC32 校验的封装 `{v,crc,p}`，业务字段在 `p` 里（含 `checkpoint_id`）；旧版写出的裸记录行仍可直接读取 |
+| `late.jsonl` | 被旁路的迟到事件（带原因与当时水位线，行格式与 `results.jsonl` 相同） |
 | `checkpoint.json` | 最新一代检查点的指针副本（兼容老版本布局与工具） |
 | `checkpoint-NNNNNNNNNN.json` | 每代一个不可变检查点文件（位点+水位+窗口状态+去重集合+本代输出批次，含 CRC） |
 
@@ -64,7 +64,46 @@ go test -race ./internal/engine/
 跳过了多少已落盘记录 `replayed`、是否修补了残行 `repaired_tail`）。
 
 故障注入：`FileSink.FailNextCommits(n)` / `FailNextCommitsAfter(n, after)`
-让接下来 n 次提交在写出 after 条后返回 `ErrSinkFault`，用于演练磁盘失败。
+让接下来 n 次提交在写出 after 条**完整记录**后返回 `ErrSinkFault`，用于演练磁盘失败；
+`FileSink.FailNextTornWrites(n, after, half)` 则在写出 after 条完整记录后，
+把下一条记录只落盘前 half 个字节（**无换行**）再失败，确定性地制造
+“进程在 write 中途被杀、文件末尾留下半截残行”的现场。
+
+## 半截残行的处理：修复补齐，而不是一启动就报错
+
+进程可能在**写出一批窗口结果或迟到记录的中途被强杀**，导致文件末尾只落下
+一部分字节。引擎重启进入恢复流程时，会先对 `results.jsonl` 与 `late.jsonl`
+做尾部检查（`FileSink.RepairTails`），然后才做回滚/批次重放：
+
+- 最近一次一致检查点之前的已确认输出原样保留；
+- 末尾**没有换行符**的半截内容被认定为“写到一半的残行”，
+  裁掉（truncate + fsync）并打日志
+  `RECOVER trimmed partial trailing write ... results=<bool> lates=<bool>`；
+- 随后这批未确认结果从最近一致检查点**幂等补齐**：已落盘的整行按身份跳过，
+  被裁掉/没写完的部分补写，因此**一条不丢、也不重复写**；补齐后再整体重跑一遍，
+  同一批结果全部走“已存在跳过”，输出仍然不重复。
+- **首次运行、还没存下任何检查点就被杀**也适用：恢复时发现无检查点，
+  同样先裁掉残行，再把未确认的历史输出整体回滚（`TruncateTo(0)`），从头重放。
+
+该行为在结果文件残行、迟到文件残行、以及两个文件**同时**残行时都成立
+（见 `TestRecoveryAfterPartialTornLines` 三个子用例与
+`TestRecoveryFirstRunNoCheckpointPartialTail`）。
+
+### 半截残行 vs 真正损坏：明确区分，绝不硬接
+
+为了把“可以修补的半截残行”和“真正损坏的文件”区分开，输出每行都带
+**CRC32 封装** `{v,crc,p}`（旧版裸记录行仍可读）：
+
+| 现场 | 特征 | 处理 |
+|---|---|---|
+| 半截残行（可修复） | 文件末尾**没有换行**：一次 write 没写完，JSON 中不会含裸换行，所以残行一定无换行 | 裁掉残字节，按检查点批次补齐 |
+| 真正损坏（不可硬接） | 行**以换行完整结束**，却无法解析、封装版本未知，或 **CRC 校验不匹配** | 保留文件原样，返回 `ErrSinkCorrupt` 明确报错 |
+
+真损坏时日志为
+`RECOVER sink file genuinely corrupt (a complete line failed to parse/verify): ... refusing to treat it as a partial tail`，
+与“修补残行”的日志一眼可分。结果、迟到记录、检查点三者的既有语义不因此改变：
+检查点损坏仍走 `ErrCheckpointCorrupt`，输出文件损坏走 `ErrSinkCorrupt`。
+
 
 ## 多代检查点与指定代恢复
 
@@ -105,8 +144,10 @@ go test -race ./internal/engine/
 ## 一致性保证（恰好一次）
 
 - 检查点覆盖：源读取位点、各分区水位、窗口累计状态、去重集合、本代提交批次。
-- 提交流程：**先写输出（带检查点 ID），再保存检查点代**。
+- 提交流程：**先写输出（带检查点 ID 与行级 CRC），再保存检查点代**。
   - 写输出失败：批次保留，按记录身份续写，不推进检查点；
+  - 进程在 write 中途被杀留下无换行半截残行：恢复先裁掉残行，
+    再按下述回滚/重放路径补齐，未确认批次一条不丢、不重；
   - 输出已写、检查点未保存时崩溃：恢复端 `TruncateTo` 回滚该批，
     窗口因仍保留在上一代状态中而被重新收割，再幂等重放——不丢不重；
   - 窗口在检查点保存成功前不离开状态，保证任意崩溃点都有兜底。
@@ -117,9 +158,9 @@ go test -race ./internal/engine/
 ## 本地验证方法
 
 ```bash
-# 单元 + 集成测试：乱序、重复、迟到、崩溃重启、写出失败续写、
+# 单元 + 集成测试：乱序、重复、迟到、崩溃重启、写出失败续写、半截残行修复、
 # 指定代恢复、v1 老检查点兼容、代数/待写出上限、背压、并发一致性
-go test ./internal/engine/ -v          # 日志含事件、窗口判定、续写与恢复依据
+go test ./internal/engine/ -v          # 日志含事件、窗口判定、续写、残行修复与恢复依据
 go test -race -count=3 ./internal/engine/
 
 # 端到端：写出故障续写（观察 SINK RETRY/RESUME 与 sink_retries/sink_replays）
@@ -130,6 +171,35 @@ go run ./cmd/streamengine -dir /tmp/g -events 600 -retain-checkpoints 5
 go run ./cmd/streamengine -dir /tmp/g -events 600 -retain-checkpoints 5 -recover-from 2
 ```
 
+### 一步步复现“写出中途被强杀 → 残行 → 重启补齐 → 重跑不重复”
+
+确定性的端到端复现由测试直接给出（不依赖调度/时序，可反复运行）：
+
+```bash
+# 结果/迟到/双文件分别残行：重启补齐、逐窗口对齐无故障基线、再重跑不重复写
+go test ./internal/engine/ -run TestRecoveryAfterPartialTornLines -v -count=10
+# 真实“撕裂写”（半截字节无换行落盘后失败）+ 崩溃，再重启补齐
+go test ./internal/engine/ -run TestTornWriteFaultAcrossRestart -v
+# 首次运行、还没检查点就被杀并留下残行：重启从头恢复
+go test ./internal/engine/ -run TestRecoveryFirstRunNoCheckpointPartialTail -v
+# 完整行 CRC 对不上：必须报 ErrSinkCorrupt，不能当残行硬接
+go test ./internal/engine/ -run TestRecoveryRejectsGenuinelyCorruptOutput -v
+```
+
+在真实文件上手工演练也可以：
+
+1. 先跑一轮基线并保存 `results.jsonl`/`late.jsonl` 作为对照；
+2. 让引擎跑到中段后强杀（测试里用 `context` 取消，等价于 kill -9）；
+3. 用编辑器/脚本在 `results.jsonl` 末尾粘贴一段**不带换行**的半截 JSON
+   （`late.jsonl` 同理，或两个文件都加），保存；
+4. 重新启动引擎：日志出现 `RECOVER trimmed partial trailing write ...`，
+   随后 `RECOVER replay ...` 把没写完的批次补齐；
+5. 对比恢复后的文件：每个窗口的归属/`count`/`sum` 与基线**逐窗口一致**，
+   迟到条数一致，没有幽灵残行记录；
+6. 再启动一次（源已耗尽，等价于重放确认）：结果条数不再增长，不重复写；
+7. 反例：追加一条**带换行**但把 CRC 改错的完整行，重启应直接失败并打印
+   `genuinely corrupt ... refusing to treat it as a partial tail`。
+
 关键测试：
 
 | 测试 | 覆盖 |
@@ -139,13 +209,22 @@ go run ./cmd/streamengine -dir /tmp/g -events 600 -retain-checkpoints 5 -recover
 | `TestCrashRecovery` | 中途取消模拟崩溃，恢复后与无崩溃基线逐窗口一致 |
 | `TestSinkCommitResumeAfterFault` | 写出失败后进程内续写：跳过已写、补齐缺失、幂等 |
 | `TestSinkRepairPartialTail` | 进程被杀留下的半行残数据被修补后正确续写 |
+| `TestRepairTailsTrimsPartialLastLine` | 无换行半截残行被裁掉；再次检查为 no-op |
+| `TestRepairTailsRejectsGenuinelyCorruptCompleteLine` | 完整行坏 JSON/CRC 错/版本未知 → `ErrSinkCorrupt`，且文件原样保留 |
+| `TestRepairTailsAcceptsLegacyBareLines` | 旧版裸记录行可读；其后残行仍可裁；裸坏行仍判损坏 |
+| `TestTornWriteFaultLeavesRepairableHalfLine` | 撕裂写故障留下无换行半截，修复后同批补齐、再提交幂等 |
+| `TestRecoveryAfterPartialTornLines` | 结果/迟到/双文件分别残行：重启补齐、对齐基线、再重跑不重复写 |
+| `TestTornWriteFaultAcrossRestart` | 真实撕裂写 + 崩溃，重启从最近检查点补齐，不丢不重 |
+| `TestRecoveryFirstRunNoCheckpointPartialTail` | 首次运行无检查点即被杀并留残行：重启裁掉残行从头恢复 |
+| `TestRecoveryRejectsGenuinelyCorruptOutput` | 输出文件完整行 CRC 错：恢复明确失败、不当残行硬接 |
 | `TestSinkFaultInRunResume` | 引擎内多次写出失败自动续写，窗口/计数/求和与基线一致 |
 | `TestSinkFaultThenCrash` | 写出失败+进程被杀，重启回滚+批次重放，不丢不重 |
 | `TestRecoverFromSpecificGeneration` | 从指定历史代恢复、分叉未来代清理、结果与基线一致 |
 | `TestLegacyV1CheckpointCompatible` | 老版本 v1 单文件检查点可读、可恢复、可跑完 |
 | `TestCheckpointRetentionLimit` | 保留代数上限生效、旧代被删并有计数 |
 | `TestPendingOutputCapPolicies` | 待写出上限：reject 明确拒绝/计数、block 阻塞后放行 |
-| `TestCheckpointCorrupt` / `TestCheckpointVersionMismatch` / `TestRecoverFromCorruptCheckpointFails` | 检查点失效可区分、不静默继续 |
+| `TestRecoverFromCorruptCheckpointFails` | 检查点 CRC 损坏时恢复明确失败、不静默继续 |
+| `TestCheckpointCorrupt` / `TestCheckpointVersionMismatch` | 检查点损坏与版本不符可区分报错 |
 | `TestBackpressureObservable` | 队列容量 1 时背压可观测且结果仍正确 |
 | `TestConcurrentShardsConsistency` | 8 分片 8 协程下无重复输出、计数自洽（`-race`） |
 

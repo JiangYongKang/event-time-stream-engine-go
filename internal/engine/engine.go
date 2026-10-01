@@ -584,6 +584,11 @@ func (e *Engine) recover() error {
 			ids, _ := e.store.Generations()
 			return fmt.Errorf("recover failed: %w (available generations=%v)", err, ids)
 		}
+		// 首次运行（还没有任何检查点）：输出文件可能残留上一进程写出中途被杀的残行。
+		// 先识别并裁掉半截残行；若发现“完整但损坏”的行则明确失败，绝不硬接。
+		if rerr := e.repairSinkTails(); rerr != nil {
+			return rerr
+		}
 		e.logger.Printf("RECOVER no checkpoint found, starting fresh; rolling back any stale sink output")
 		if terr := e.sink.TruncateTo(0); terr != nil {
 			return terr
@@ -644,6 +649,11 @@ func (e *Engine) recover() error {
 		e.dedup[i].mu.Unlock()
 	}
 	e.wm.Restore(cp.Watermark)
+	// 回滚前先处理写出中途被杀留下的半截残行（有检查点场景）：
+	// 残行裁掉后随下面的批次重放补齐；真正损坏（完整行解析/CRC 失败）则明确报错。
+	if rerr := e.repairSinkTails(); rerr != nil {
+		return rerr
+	}
 	if err := e.sink.TruncateTo(cp.ID); err != nil {
 		return fmt.Errorf("rollback uncommitted sink output: %w", err)
 	}
@@ -795,4 +805,20 @@ func latePolicyName(p LateOverflowPolicy) string {
 		return "block"
 	}
 	return "reject"
+}
+
+// repairSinkTails 在恢复开始时处理输出文件尾部：
+// 半截残行（无换行的不完整写入）被裁掉并打日志，随后由检查点批次幂等补齐；
+// 完整但解析失败 / CRC 不匹配的行属于真损坏，包装 ErrSinkCorrupt 明确失败，绝不硬接。
+func (e *Engine) repairSinkTails() error {
+	rep, err := e.sink.RepairTails()
+	if err != nil {
+		e.logger.Printf("RECOVER sink file genuinely corrupt (a complete line failed to parse/verify): %v; refusing to treat it as a partial tail", err)
+		return fmt.Errorf("recover failed: %w", err)
+	}
+	if rep.ResultsTrim || rep.LateTrim {
+		e.logger.Printf("RECOVER trimmed partial trailing write (process killed mid-write): results=%v lates=%v; torn bytes discarded and will be refilled idempotently",
+			rep.ResultsTrim, rep.LateTrim)
+	}
+	return nil
 }

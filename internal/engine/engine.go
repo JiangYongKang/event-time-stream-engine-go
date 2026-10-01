@@ -37,6 +37,11 @@ type Config struct {
 	// 主要用于测试确定性触发崩溃等场景。
 	ProcessedHook func(processed uint64)
 
+	// CheckpointHook 在每代检查点成功持久化之后、收割窗口移出状态之后同步回调，
+	// 参数为刚保存的检查点。用于在确定的检查点边界触发动作（如测试精确模拟被杀），
+	// 不依赖调度时序。生产环境留空即可。
+	CheckpointHook func(cp Checkpoint)
+
 	// RetainCheckpoints 保留的检查点代数；0 用默认值（3）。
 	RetainCheckpoints int
 	// RecoverFromGeneration > 0 时从指定代恢复；0 表示从最新代恢复。
@@ -63,6 +68,7 @@ type Stats struct {
 	WindowDefers       uint64 // 因待写出上限而延后（留在状态中）的窗口数
 	SinkRetries        uint64 // 写出失败后的续写次数（同批再次提交）
 	SinkReplays        uint64 // 续写时跳过的已落盘记录数（去重，避免重复写）
+	TailRepairs        uint64 // 对末尾半截残行执行裁剪的次数（回滚按文件计，提交/重放按批次计）
 }
 
 // shard 是窗口状态分片：同一 key 永远路由到同一分片，
@@ -92,6 +98,7 @@ type metrics struct {
 	winDefers   atomic.Uint64
 	sinkRetries atomic.Uint64
 	sinkReplays atomic.Uint64
+	tailRepairs atomic.Uint64
 }
 
 // Engine 是流处理引擎主体。
@@ -173,6 +180,9 @@ func NewEngine(cfg Config, source *FileSource, sink *FileSink, store *Checkpoint
 	} else {
 		e.logger = log.New(nopWriter{}, "", 0)
 	}
+	// sink 与引擎共用日志：残行修补（SINK TAIL REPAIR）与真正损坏
+	// （SINK CORRUPT）的区分结论要能从运行日志直接看出来。
+	e.sink.SetLogger(e.logger)
 	return e
 }
 
@@ -195,6 +205,7 @@ func (e *Engine) Stats() Stats {
 		WindowDefers:       e.m.winDefers.Load(),
 		SinkRetries:        e.m.sinkRetries.Load(),
 		SinkReplays:        e.m.sinkReplays.Load(),
+		TailRepairs:        e.m.tailRepairs.Load(),
 	}
 }
 
@@ -519,6 +530,9 @@ func (e *Engine) checkpoint() error {
 	e.logger.Printf("CHECKPOINT id=%d offset=%d watermark=%d open_windows=%d results=%d lates=%d retained_generations=%d pruned=%v%s",
 		cpID, cp.Offset, wm, openWindows, len(committedR), len(committedL),
 		e.store.Retain(), info.Pruned, migrateNote(info.Migrated))
+	if e.cfg.CheckpointHook != nil {
+		e.cfg.CheckpointHook(*cp)
+	}
 	return nil
 }
 
@@ -550,6 +564,9 @@ func (e *Engine) commitPending(checkpointID uint64) (results []WindowResult, lat
 	if rep.Resume {
 		e.m.sinkRetries.Add(1)
 		e.m.sinkReplays.Add(uint64(replays))
+		if rep.RepairedTail {
+			e.m.tailRepairs.Add(1)
+		}
 		e.logger.Printf("SINK RESUME checkpoint=%d repaired_tail=%v replayed(skipped)=%d (results=%d lates=%d) written(results=%d lates=%d)",
 			checkpointID, rep.RepairedTail, replays, rep.ReplayedResults, rep.ReplayedLates,
 			rep.WrittenResults, rep.WrittenLates)
@@ -585,8 +602,13 @@ func (e *Engine) recover() error {
 			return fmt.Errorf("recover failed: %w (available generations=%v)", err, ids)
 		}
 		e.logger.Printf("RECOVER no checkpoint found, starting fresh; rolling back any stale sink output")
-		if terr := e.sink.TruncateTo(0); terr != nil {
+		trep, terr := e.sink.TruncateTo(0)
+		if terr != nil {
 			return terr
+		}
+		if n := tailRepairCount(trep); n > 0 {
+			e.m.tailRepairs.Add(uint64(n))
+			e.logger.Printf("RECOVER discarded %d partial tail fragment(s) from unconfirmed first-run output before fresh start", n)
 		}
 		return e.source.SeekOffset(0)
 	case err != nil:
@@ -644,8 +666,13 @@ func (e *Engine) recover() error {
 		e.dedup[i].mu.Unlock()
 	}
 	e.wm.Restore(cp.Watermark)
-	if err := e.sink.TruncateTo(cp.ID); err != nil {
+	trep, err := e.sink.TruncateTo(cp.ID)
+	if err != nil {
 		return fmt.Errorf("rollback uncommitted sink output: %w", err)
+	}
+	if n := tailRepairCount(trep); n > 0 {
+		e.m.tailRepairs.Add(uint64(n))
+		e.logger.Printf("RECOVER discarded %d partial tail fragment(s) while rolling back uncommitted output to checkpoint %d", n, cp.ID)
 	}
 	if err := e.source.SeekOffset(cp.Offset); err != nil {
 		return fmt.Errorf("seek source: %w", err)
@@ -658,6 +685,9 @@ func (e *Engine) recover() error {
 		rep, rerr := e.sink.CommitBatch(cp.ID, cp.PendingResults, cp.PendingLates)
 		if rerr != nil {
 			return fmt.Errorf("replay committed batch for checkpoint %d: %w", cp.ID, rerr)
+		}
+		if rep.RepairedTail {
+			e.m.tailRepairs.Add(1)
 		}
 		e.logger.Printf("RECOVER replay checkpoint=%d repaired_tail=%v replayed(skipped)=%d (results=%d lates=%d) rewritten(results=%d lates=%d)",
 			cp.ID, rep.RepairedTail, rep.ReplayedResults+rep.ReplayedLates,
@@ -721,6 +751,18 @@ func (e *Engine) pendingCount() int {
 	e.pendingMu.Lock()
 	defer e.pendingMu.Unlock()
 	return len(e.pendingResults) + len(e.pendingLates)
+}
+
+// tailRepairCount 统计一次回滚中实际修补过残尾的输出文件数（0~2）。
+func tailRepairCount(r TruncateReport) int {
+	n := 0
+	if r.ResultsRepaired {
+		n++
+	}
+	if r.LatesRepaired {
+		n++
+	}
+	return n
 }
 
 func (e *Engine) signalCheckpoint() {

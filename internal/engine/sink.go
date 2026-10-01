@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +15,84 @@ import (
 
 // ErrSinkFault 是故障注入产生的写出错误，测试用它区分“模拟磁盘失败”与真实 I/O 错误。
 var ErrSinkFault = errors.New("simulated sink write fault")
+
+// ErrSinkCorrupt 表示输出文件里一条“以换行结束的完整记录”未通过校验
+// （无法解析 / 格式未知 / CRC32 不匹配）。这属于真正的文件损坏，
+// 与“末尾没写完的半截残行”严格区分：后者启动时自动裁掉补齐，前者明确报错、绝不硬接。
+var ErrSinkCorrupt = errors.New("sink file corrupt")
+
+// ErrSinkPartialTail 表示文件末尾残留一段没有换行结束的半截记录
+// （写出中途进程被杀）。引擎在提交/回滚前会自动裁掉它；
+// 只读扫描遇到它时单独报错，提示“重启引擎即可修补”，而不是混同为损坏。
+var ErrSinkPartialTail = errors.New("sink file partial tail")
+
+// sinkFormatV1 是当前写出记录封装的格式标记。旧版本直接把
+// WindowResult/LateRecord 裸 JSON 写成一行（没有 format 字段），读取时仍兼容。
+const sinkFormatV1 = "etse-jsonl/v1"
+
+// sinkEnvelope 是输出文件每行的封装：业务记录原样 JSON + CRC32。
+// CRC 让“内容完整但字节已损坏”的记录能被明确识别为真正损坏，
+// 而不会被当成可修补残行或正常记录。
+type sinkEnvelope struct {
+	Format string          `json:"format"`
+	CRC32  uint32          `json:"crc32"`
+	Body   json.RawMessage `json:"body"`
+}
+
+// encodeRecord 把一条业务记录封装成带 CRC32 的 JSON 行（不含换行）。
+func encodeRecord[T any](rec T) ([]byte, error) {
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal sink record: %w", err)
+	}
+	data, err := json.Marshal(sinkEnvelope{
+		Format: sinkFormatV1,
+		CRC32:  crc32.ChecksumIEEE(body),
+		Body:   body,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal sink envelope: %w", err)
+	}
+	return data, nil
+}
+
+// decodeRecord 解析输出文件中的一行（不含行尾换行）。
+// legacy=true 表示该行是旧版本裸 JSON（无 CRC，按兼容语义信任）；
+// 新封装行必须格式与 CRC32 都通过，否则返回包装了 ErrSinkCorrupt 的错误。
+func decodeRecord[T any](path string, line []byte) (rec T, legacy bool, err error) {
+	var probe map[string]json.RawMessage
+	if uerr := json.Unmarshal(line, &probe); uerr != nil {
+		return rec, false, sinkCorruptError(path, fmt.Sprintf("complete line is not valid JSON: %v", uerr))
+	}
+	if probe == nil {
+		return rec, false, sinkCorruptError(path, "complete line is not a JSON object")
+	}
+	if _, marked := probe["format"]; marked {
+		var env sinkEnvelope
+		if jerr := json.Unmarshal(line, &env); jerr != nil {
+			return rec, false, sinkCorruptError(path, fmt.Sprintf("record envelope invalid: %v", jerr))
+		}
+		if env.Format != sinkFormatV1 {
+			return rec, false, sinkCorruptError(path, fmt.Sprintf("unknown record format %q", env.Format))
+		}
+		if crc32.ChecksumIEEE(env.Body) != env.CRC32 {
+			return rec, false, sinkCorruptError(path, "record checksum mismatch: file content is damaged (a complete record, not a partial tail)")
+		}
+		if derr := json.Unmarshal(env.Body, &rec); derr != nil {
+			return rec, false, sinkCorruptError(path, fmt.Sprintf("record body invalid: %v", derr))
+		}
+		return rec, false, nil
+	}
+	// 旧版本裸记录：无 CRC 可校验，按向后兼容直接解码。
+	if derr := json.Unmarshal(line, &rec); derr != nil {
+		return rec, false, sinkCorruptError(path, fmt.Sprintf("legacy record invalid: %v", derr))
+	}
+	return rec, true, nil
+}
+
+func sinkCorruptError(path, detail string) error {
+	return fmt.Errorf("%w: %s: %s", ErrSinkCorrupt, path, detail)
+}
 
 // CommitReport 描述一次提交实际做了什么，用于日志与指标，
 // 让“重试/重放了哪些记录”从外部可见。
@@ -43,11 +124,27 @@ type FileSink struct {
 	// 故障注入：faultRemaining>0 时，下一次 CommitBatch 在写出 faultAfter 条后失败。
 	faultRemaining int
 	faultAfter     int
+
+	logger *log.Logger // 残行修补/真正损坏的区分日志；nil 则丢弃
 }
 
 func NewFileSink(resultsPath, latePath string) *FileSink {
 	return &FileSink{resultsPath: resultsPath, latePath: latePath}
 }
+
+// SetLogger 注入运行日志（仅应在引擎启动、无并发写出时设置）。
+func (s *FileSink) SetLogger(l *log.Logger) { s.logger = l }
+
+func (s *FileSink) log() *log.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return log.New(nopSinkWriter{}, "", 0)
+}
+
+type nopSinkWriter struct{}
+
+func (nopSinkWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 // FailNextCommits 让接下来 n 次提交在写出 1 条记录后返回 ErrSinkFault
 // （模拟磁盘写到一半失败 / 进程在写出过程中被杀）。
@@ -81,14 +178,15 @@ func (s *FileSink) CommitBatch(checkpointID uint64, results []WindowResult, late
 	defer s.mu.Unlock()
 
 	rep := CommitReport{CheckpointID: checkpointID}
+	logger := s.log()
 
-	rr, err := prepareAppend[WindowResult](s.resultsPath, checkpointID, resultID,
-		func(r WindowResult) uint64 { return r.CheckpointID })
+	rr, err := prepareAppend[WindowResult](s.resultsPath, checkpointID, logger,
+		resultID, func(r WindowResult) uint64 { return r.CheckpointID })
 	if err != nil {
 		return rep, err
 	}
-	rl, err := prepareAppend[LateRecord](s.latePath, checkpointID, lateID,
-		func(r LateRecord) uint64 { return r.CheckpointID })
+	rl, err := prepareAppend[LateRecord](s.latePath, checkpointID, logger,
+		lateID, func(r LateRecord) uint64 { return r.CheckpointID })
 	if err != nil {
 		return rep, err
 	}
@@ -145,9 +243,10 @@ type appendState struct {
 
 // prepareAppend 修补残缺尾行并收集已存在的本批记录身份。
 // 返回的 repaired 标记本次是否实际裁掉过残数据。
-func prepareAppend[T any](path string, checkpointID uint64, idOf func(T) string, cpOf func(T) uint64) (appendState, error) {
+func prepareAppend[T any](path string, checkpointID uint64, logger *log.Logger,
+	idOf func(T) string, cpOf func(T) uint64) (appendState, error) {
 	st := appendState{exists: map[string]struct{}{}}
-	repaired, err := repairPartialTail(path)
+	repaired, err := repairPartialTail[T](path, logger)
 	if err != nil {
 		return st, err
 	}
@@ -160,35 +259,33 @@ func prepareAppend[T any](path string, checkpointID uint64, idOf func(T) string,
 		return st, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := trimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return st, fmt.Errorf("sink file %s corrupt: %w", path, err)
-		}
+	err = scanRecords[T](f, path, func(rec T, _ bool) error {
 		if cpOf(rec) > checkpointID {
-			return st, fmt.Errorf("sink file %s contains future checkpoint %d (committing %d): refusing to resume",
+			return fmt.Errorf("sink file %s contains future checkpoint %d (committing %d): refusing to resume",
 				path, cpOf(rec), checkpointID)
 		}
 		if cpOf(rec) == checkpointID {
 			st.exists[idOf(rec)] = struct{}{}
 		}
-	}
-	if err := sc.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return st, err
 	}
 	return st, nil
 }
 
-// repairPartialTail 裁掉文件末尾写到一半的残数据，返回是否实际裁剪过。
-// 判定方式：逐行扫描，保留“以换行结束且可解析”的最长合法前缀，
-// 其后的任何字节（无换行的半截行，或有换行但解析失败的最后一行）都裁掉。
-func repairPartialTail(path string) (bool, error) {
+// repairPartialTail 检查并裁掉文件末尾“写到一半的半截残行”，返回是否实际裁剪过。
+//
+// 判定原则（严格区分可修补残行与真正损坏）：
+//   - 逐行读取：以 '\n' 结束的每一行都视为“完整写完”的记录，
+//     必须能通过格式/CRC32 校验；任何一条完整行校验失败 -> ErrSinkCorrupt，
+//     明确报错，绝不当残行裁掉（它前面可能还有好数据，会静默丢记录）；
+//   - 只有文件最后一段“没有 '\n' 结束的尾巴”才是写出中途被杀留下的残行：
+//     无论它是否恰好是合法 JSON（可能是没来得及写换行的完整记录），
+//     由于该批尚未确认，一律裁掉并由后续提交/重放补齐；
+//   - 纯空白尾巴（如尾随空行）不裁剪、不算修补。
+func repairPartialTail[T any](path string, logger *log.Logger) (bool, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -212,24 +309,63 @@ func repairPartialTail(path string) (bool, error) {
 		line, rerr := reader.ReadBytes('\n')
 		n := int64(len(line))
 		if rerr == nil {
-			// 完整行：可解析才算合法前缀。
-			var raw map[string]any
-			if json.Unmarshal(trimSpace(line), &raw) == nil {
-				validLen = offset + n
+			// 完整行：必须通过校验；失败即真正损坏，报错且不裁剪。
+			if _, _, derr := decodeRecord[T](path, trimSpace(line)); derr != nil {
+				logger.Printf("SINK CORRUPT %s: %v (complete record failed verification; not treated as partial tail, refusing recovery)", path, derr)
+				return false, derr
 			}
-		} else {
-			// 读到 EOF（或其它错误）且没有以换行结束 -> 残行，停止。
-			break
+			validLen = offset + n
+			offset += n
+			continue
 		}
-		offset += n
+		if !errors.Is(rerr, io.EOF) {
+			return false, rerr
+		}
+		// 读到文件尾：line 是最后一段没有换行结束的字节（可能为空）。
+		if len(line) > 0 && len(trimSpace(line)) > 0 {
+			// 半截残行（进程写出中途被杀）：截到最后一条完整记录之后。
+			logger.Printf("SINK TAIL REPAIR %s: discarding %d unterminated byte(s) left by a killed mid-write at offset %d (batch will be re-written, no data loss)",
+				path, len(line), offset)
+			if terr := f.Truncate(validLen); terr != nil {
+				return false, terr
+			}
+			if serr := f.Sync(); serr != nil {
+				return false, serr
+			}
+			return true, nil
+		}
+		break
 	}
-	if validLen == size {
-		return false, nil
+	return false, nil
+}
+
+// scanRecords 逐行扫描一个已确认没有残尾的输出文件（调用方应先 repairPartialTail）。
+// cb 对每条校验通过的完整记录回调；任何校验失败/残尾都返回可区分错误。
+func scanRecords[T any](r io.Reader, path string, cb func(rec T, legacy bool) error) error {
+	reader := bufio.NewReader(r)
+	for {
+		line, rerr := reader.ReadBytes('\n')
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				return rerr
+			}
+			if len(line) > 0 && len(trimSpace(line)) > 0 {
+				return fmt.Errorf("%w: %s: unterminated trailing record (restart engine to repair the partial tail)", ErrSinkPartialTail, path)
+			}
+			return nil
+		}
+		line = trimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		rec, _, derr := decodeRecord[T](path, line)
+		if derr != nil {
+			return derr
+		}
+		if err := cb(rec, false); err != nil {
+			return err
+		}
 	}
-	if err := f.Truncate(validLen); err != nil {
-		return false, err
-	}
-	return true, f.Sync()
 }
 
 // appendMissing 追加文件中尚不存在的本批记录，返回（已存在跳过数, 新追加数）。
@@ -257,7 +393,7 @@ func appendMissing[T any](path string, records []T, st appendState, idOf func(T)
 			w.Flush()
 			return skipped, added, ferr
 		}
-		data, merr := json.Marshal(rec)
+		data, merr := encodeRecord(rec)
 		if merr != nil {
 			w.Flush()
 			return skipped, added, merr
@@ -286,73 +422,91 @@ func appendMissing[T any](path string, records []T, st appendState, idOf func(T)
 	return skipped, added, nil
 }
 
-// TruncateTo 回滚所有属于 checkpointID 之后（未确认）检查点的写出记录。
-// 用于崩溃恢复：检查点保存成功之前的 Commit 视为未提交，必须撤销。
-func (s *FileSink) TruncateTo(checkpointID uint64) error {
-	if err := truncateFile[WindowResult](s.resultsPath, checkpointID, func(r WindowResult) uint64 { return r.CheckpointID }); err != nil {
-		return err
-	}
-	return truncateFile[LateRecord](s.latePath, checkpointID, func(r LateRecord) uint64 { return r.CheckpointID })
+// TruncateReport 汇报一次崩溃恢复回滚在输出文件上实际做了什么。
+type TruncateReport struct {
+	ResultsRepaired bool // results.jsonl 是否裁掉了半截残行
+	LatesRepaired   bool // late.jsonl 是否裁掉了半截残行
 }
 
-func truncateFile[T any](path string, checkpointID uint64, cpOf func(T) uint64) error {
+// TruncateTo 回滚所有属于 checkpointID 之后（未确认）检查点的写出记录。
+// 用于崩溃恢复：检查点保存成功之前的 Commit 视为未提交，必须撤销。
+//
+// 回滚前先修补两个文件末尾的半截残行：进程可能在写出这批未确认记录时
+// 直接被杀，残行本身没有合法换行、扫描会失败；它属于未确认批，
+// 随回滚一起裁掉，随后由检查点状态重算/批次重放补齐。
+// 一条“以换行结束”的完整记录若校验失败，属于真正损坏，直接报错、绝不硬接。
+func (s *FileSink) TruncateTo(checkpointID uint64) (TruncateReport, error) {
+	var rep TruncateReport
+	r1, err := truncateFile[WindowResult](s.resultsPath, checkpointID, s.log(),
+		func(r WindowResult) uint64 { return r.CheckpointID })
+	if err != nil {
+		return rep, err
+	}
+	r2, err := truncateFile[LateRecord](s.latePath, checkpointID, s.log(),
+		func(r LateRecord) uint64 { return r.CheckpointID })
+	if err != nil {
+		return rep, err
+	}
+	rep.ResultsRepaired = r1
+	rep.LatesRepaired = r2
+	return rep, nil
+}
+
+// truncateFile 先裁掉末尾半截残行，再重写只含 cp<=checkpointID 的记录，
+// 返回是否修补过残行。
+func truncateFile[T any](path string, checkpointID uint64, logger *log.Logger, cpOf func(T) uint64) (bool, error) {
+	repaired, err := repairPartialTail[T](path, logger)
+	if err != nil {
+		return false, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return repaired, nil
 		}
-		return err
+		return repaired, err
 	}
-	defer f.Close()
 	var kept []T
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := trimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return fmt.Errorf("sink file %s corrupt: %w", path, err)
-		}
+	scanErr := scanRecords[T](f, path, func(rec T, _ bool) error {
 		if cpOf(rec) <= checkpointID {
 			kept = append(kept, rec)
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
+		return nil
+	})
+	f.Close()
+	if scanErr != nil {
+		return repaired, scanErr
 	}
 	tmp := path + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return repaired, err
 	}
 	w := bufio.NewWriter(out)
 	for _, rec := range kept {
-		data, err := json.Marshal(rec)
+		data, err := encodeRecord(rec)
 		if err != nil {
 			out.Close()
-			return err
+			return repaired, err
 		}
 		if _, err := w.Write(data); err != nil {
 			out.Close()
-			return err
+			return repaired, err
 		}
 		w.WriteByte('\n')
 	}
 	if err := w.Flush(); err != nil {
 		out.Close()
-		return err
+		return repaired, err
 	}
 	if err := out.Sync(); err != nil {
 		out.Close()
-		return err
+		return repaired, err
 	}
 	if err := out.Close(); err != nil {
-		return err
+		return repaired, err
 	}
-	return os.Rename(tmp, path)
+	return repaired, os.Rename(tmp, path)
 }
 
 // ReadResults 读取全部已写出的窗口结果。
@@ -375,18 +529,12 @@ func readAll[T any](path string) ([]T, error) {
 	}
 	defer f.Close()
 	var out []T
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := trimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var rec T
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("sink file %s corrupt: %w", path, err)
-		}
+	err = scanRecords[T](f, path, func(rec T, _ bool) error {
 		out = append(out, rec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, sc.Err()
+	return out, nil
 }

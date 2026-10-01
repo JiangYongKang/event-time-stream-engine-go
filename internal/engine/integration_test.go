@@ -347,7 +347,7 @@ func TestSinkTruncateRollback(t *testing.T) {
 	if err := sink.Commit(2, []WindowResult{{Key: "a", Count: 2, CheckpointID: 2}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.TruncateTo(1); err != nil {
+	if _, err := sink.TruncateTo(1); err != nil {
 		t.Fatal(err)
 	}
 	res, err := sink.ReadResults()
